@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.app/
+
+# macOS
+.DS_Store
+
+# Local agent memory
+.remember/
+
+# Downloaded binaries (fetched at build/runtime)
+bin/
