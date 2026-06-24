@@ -956,17 +956,25 @@ class DownloadSlot:
     # ── Playlist parallel ──────────────────────────────────────────────────────
 
     def _get_playlist_ids(self, url):
+        # Enumerating a playlist can take 20-60s+ when YouTube throttles/rate-limits
+        # (worse on the current yt-dlp's heavier extraction). One retry + a generous
+        # timeout, matching _fetch_title, so a slow-but-working fetch isn't dropped
+        # as "Could not fetch playlist."
         ytdlp = _find_bin("yt-dlp")
-        try:
-            r = subprocess.run(
-                [ytdlp, "--flat-playlist", "--print", "id", "--no-warnings", url],
-                capture_output=True, text=True, env=_ENV, timeout=30,
-            )
-            if r.returncode != 0:
-                return []
-            return [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
-        except Exception:
-            return []
+        for attempt in range(2):
+            try:
+                r = subprocess.run(
+                    [ytdlp, "--flat-playlist", "--print", "id",
+                     "--no-warnings", "--socket-timeout", "20", url],
+                    capture_output=True, text=True, env=_ENV, timeout=90,
+                )
+                if r.returncode == 0:
+                    ids = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
+                    if ids:
+                        return ids
+            except Exception:
+                pass
+        return []
 
     def _run_playlist_parallel(self, url):
         self._app.after(0, lambda: self._set_status("Fetching playlist…"))
