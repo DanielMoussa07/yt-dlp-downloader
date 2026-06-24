@@ -791,17 +791,60 @@ class DownloadSlot:
 
     def stop_download(self):
         self._stop_requested = True
-        for p in list(self._processes):
+        procs = list(self._processes)
+        if self._process:
+            procs.append(self._process)
+        for p in procs:
             try: os.killpg(os.getpgid(p.pid), signal.SIGTERM)
             except Exception:
                 try: p.terminate()
                 except Exception: pass
-        if self._process:
-            try: os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
-            except Exception:
-                try: self._process.terminate()
+        # Reap on a background thread so the Tk event loop never blocks during the
+        # wait/kill window. The slot goes idle only after every child is dead.
+        threading.Thread(
+            target=self._reap_and_finish, args=(procs,), daemon=True
+        ).start()
+
+    def _reap_and_finish(self, procs):
+        # Cancel sent SIGTERM already. A child (ffmpeg remux, fragment writers) may
+        # ignore it and keep a *.part file open — macOS then refuses to delete the
+        # file (Finder error -8058). Escalate to SIGKILL on the whole process group
+        # (downloads use start_new_session=True, so killpg reaps the children too),
+        # then clean up the leftover partials before marking the slot idle.
+        for p in procs:
+            try:
+                p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try: os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:
+                    try: p.kill()
+                    except Exception: pass
+                try: p.wait(timeout=3)
                 except Exception: pass
+            except Exception:
+                pass
+        self._cleanup_partials()
         self._app.after(0, lambda: self._set_idle("Cancelled."))
+
+    def _cleanup_partials(self):
+        # Remove leftover fragment files from the cancelled download. Safe only
+        # after _reap_and_finish has confirmed every child is dead — nothing holds
+        # these open anymore, so the user is no longer left with undeletable files.
+        try:
+            base = Path(self._dir_path)
+        except Exception:
+            return
+        seen = set()
+        for pat in ("*.part", "*.ytdl", "*.part-Frag*", "*.part.aria2", "*.aria2"):
+            try:
+                for f in base.glob(pat):
+                    if f in seen:
+                        continue
+                    seen.add(f)
+                    try: f.unlink()
+                    except Exception: pass
+            except Exception:
+                pass
 
     def _set_status(self, text, speed=""):
         self.status_label.configure(text=text)
