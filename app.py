@@ -54,7 +54,7 @@ FORMATS   = ["MP4", "MP3", "MKV", "WebM", "M4A", "Opus"]
 QUALITIES = ["Best", "4K (2160p)", "1080p", "720p", "480p", "360p"]
 SPEEDS    = ["Normal", "Fast", "Maximum"]
 SPEED_DEFAULT    = "Maximum"
-PARALLEL_DEFAULT = "4"
+PARALLEL_DEFAULT = "2"
 DOWNLOAD_DIR     = str(Path.home() / "Downloads")
 
 QUALITY_MAP = {
@@ -66,10 +66,17 @@ QUALITY_MAP = {
     "360p":       "bestvideo[height<=360]+bestaudio/best[height<=360]",
 }
 
+# Fragment concurrency PER yt-dlp process. These multiply by the parallel-slot
+# count (PARALLEL_DEFAULT) into total simultaneous connections to YouTube. Past
+# ~5 connections YouTube's nsig throttle kicks in and chokes every connection to
+# ~0 KB/s (the "downloads stall after a minute" bug). 16 frags × 4 parallel = 64
+# connections guaranteed that stall — these conservative values keep the total
+# (e.g. 5 × 2 = 10) under the throttle threshold while still saturating bandwidth,
+# since YouTube rate-limits per-connection anyway and >5 frags gives little gain.
 SPEED_FLAGS = {
     "Normal":  [],
-    "Fast":    ["--concurrent-fragments", "8"],
-    "Maximum": ["--concurrent-fragments", "16"],
+    "Fast":    ["--concurrent-fragments", "3"],
+    "Maximum": ["--concurrent-fragments", "5"],
 }
 
 SLOT_HEADER_H   = 46
@@ -811,7 +818,11 @@ class DownloadSlot:
 
     def stop_download(self):
         self._stop_requested = True
-        procs = list(self._processes)
+        # Snapshot under the same lock _dl_one registers children with, so a child
+        # mid-spawn is either already in the list (we kill it here) or sees the flag
+        # set and kills itself — neither path leaks a process holding a *.part open.
+        with self._pl_lock:
+            procs = list(self._processes)
         if self._process:
             procs.append(self._process)
         for p in procs:
@@ -917,9 +928,11 @@ class DownloadSlot:
         cmd += ["-o", out_tmpl]
 
         # Survive YouTube throttling, esp. under parallel load: retry the whole
-        # download and individual fragments instead of erroring out.
+        # download and individual fragments instead of erroring out. --sleep-requests
+        # paces the metadata/nsig API calls (the ones that trigger 429 and the
+        # throttle-to-0 stall) without slowing the actual byte transfer.
         cmd += ["--retries", "5", "--fragment-retries", "20",
-                "--retry-sleep", "3", "--no-update"]
+                "--retry-sleep", "3", "--sleep-requests", "1", "--no-update"]
 
         if playlist_item is not None:
             cmd += ["--playlist-items", str(playlist_item)]
@@ -1067,7 +1080,19 @@ class DownloadSlot:
                     preexec_fn=lambda: os.nice(10),
                 )
                 with self._pl_lock:
-                    self._processes.append(p)
+                    registered = not self._stop_requested
+                    if registered:
+                        self._processes.append(p)
+                if not registered:
+                    # Cancel fired between the pre-spawn check and Popen returning,
+                    # so this child escaped stop_download's snapshot. Kill it now —
+                    # otherwise it keeps a *.part file open and macOS refuses to
+                    # delete it (Finder error -8058, the undeletable-file bug).
+                    try: os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    except Exception:
+                        try: p.kill()
+                        except Exception: pass
+                    return
                 for line in p.stdout:
                     self._parse_progress(line.strip(), pl_idx=idx, pl_total=total)
                 p.wait()

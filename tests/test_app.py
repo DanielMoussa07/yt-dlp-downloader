@@ -39,8 +39,36 @@ def test_speed_flags_no_aria2c():
     # Regression: aria2c left 0-byte .part files on YouTube; must be gone.
     for name, flags in app.SPEED_FLAGS.items():
         assert "aria2c" not in " ".join(flags), f"{name} still references aria2c"
-    assert app.SPEED_FLAGS["Maximum"] == ["--concurrent-fragments", "16"]
     assert app.SPEED_FLAGS["Normal"] == []
+
+
+def _frags(name):
+    flags = app.SPEED_FLAGS[name]
+    if "--concurrent-fragments" not in flags:
+        return 1
+    return int(flags[flags.index("--concurrent-fragments") + 1])
+
+
+def test_connection_budget_under_youtube_throttle():
+    # Regression: 4 parallel slots * 16 fragments = 64 simultaneous connections
+    # tripped YouTube's nsig throttle and stalled every download at ~0 KB/s.
+    # Cap total connections (parallel slots * per-process fragments) so the flood
+    # can't recur. >5 connections is where the throttle reliably kicks in.
+    for name in app.SPEED_FLAGS:
+        assert _frags(name) <= 5, f"{name} fragment count too high: {_frags(name)}"
+    parallel = int(app.PARALLEL_DEFAULT)
+    assert parallel <= 2, f"PARALLEL_DEFAULT too high: {parallel}"
+    worst_case = parallel * _frags("Maximum")
+    assert worst_case <= 10, f"worst-case connection flood: {worst_case}"
+
+
+def test_build_cmd_paces_requests():
+    # The throttle-to-0 stall is driven by hammering the metadata/nsig API. The
+    # command must pace requests and retry fragments to ride out throttling.
+    import inspect
+    src = inspect.getsource(app.DownloadSlot._build_cmd)
+    assert "--sleep-requests" in src, "must pace API requests to avoid 429 throttle"
+    assert "--fragment-retries" in src, "must retry throttled fragments"
 
 
 def test_unit_conversions():
@@ -119,6 +147,51 @@ def test_process_group_kill_reaps_children():
     assert not alive, "child survived group SIGKILL"
 
 
+def test_dl_one_kills_child_spawned_after_cancel():
+    # Regression: stop_download snapshots _processes, but _dl_one registered its
+    # child only AFTER Popen returned. A cancel firing in that window left an
+    # unreaped yt-dlp holding a *.part open (the undeletable-file bug). _dl_one must
+    # detect the race and kill its own child instead of leaking it.
+    import threading
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = -999999          # bogus pid -> os.getpgid raises -> p.kill()
+            self.killed = False
+            self.returncode = -1
+        @property
+        def stdout(self):
+            raise AssertionError("must not read stdout of a cancelled child")
+        def wait(self, *a, **k): return -1
+        def poll(self): return -1
+        def kill(self): self.killed = True
+
+    slot = _FakeSlot()
+    slot._stop_requested = False
+    slot._pl_lock   = threading.Lock()
+    slot._pl_active = 0
+    slot._active    = {}
+    slot._processes = []
+    slot._build_cmd = lambda url, playlist_item=None: ["dummy"]
+
+    fake = FakeProc()
+    orig_popen = app.subprocess.Popen
+
+    def fake_popen(*a, **k):
+        slot._stop_requested = True      # cancel fires DURING spawn (the race window)
+        return fake
+
+    app.subprocess.Popen = fake_popen
+    try:
+        app.DownloadSlot._dl_one(slot, "url", 1, 1, threading.Semaphore(1))
+    finally:
+        app.subprocess.Popen = orig_popen
+
+    assert fake.killed, "child spawned after cancel was not killed (would leak a .part)"
+    assert fake not in slot._processes, "cancelled child must not be registered"
+    assert slot._pl_active == 0, "active counter not released"
+
+
 def test_get_playlist_ids_uses_generous_timeout():
     # Regression #4: the call was capped at 30s; verify the source now allows 90s.
     import inspect
@@ -163,10 +236,13 @@ def test_title_fetch_command_live():
 
 DETERMINISTIC = [
     test_speed_flags_no_aria2c,
+    test_connection_budget_under_youtube_throttle,
+    test_build_cmd_paces_requests,
     test_unit_conversions,
     test_cleanup_partials_removes_only_fragments,
     test_cleanup_partials_survives_missing_dir,
     test_process_group_kill_reaps_children,
+    test_dl_one_kills_child_spawned_after_cancel,
     test_get_playlist_ids_uses_generous_timeout,
 ]
 NETWORK = [
