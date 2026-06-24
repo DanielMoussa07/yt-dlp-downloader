@@ -1,10 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 
 
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=[('/Users/danielmoussa/.ytdlp-downloader/bin/yt-dlp', 'bin'), ('/opt/homebrew/bin/ffmpeg', 'bin'), ('/opt/homebrew/bin/aria2c', 'bin')],
+    binaries=[(os.path.expanduser('~/.ytdlp-downloader/bin/yt-dlp'), 'bin'), ('/opt/homebrew/bin/ffmpeg', 'bin'), ('/opt/homebrew/bin/aria2c', 'bin')],
     datas=[],
     hiddenimports=[],
     hookspath=[],
