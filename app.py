@@ -691,12 +691,16 @@ class DownloadSlot:
 
     def _fetch_title(self, url, gen):
         ytdlp = _find_bin("yt-dlp")
+        # Phase 1 — title only (fast). The playlist video count requires walking
+        # the whole playlist, which under YouTube throttling can take 40-60s+; that
+        # was overrunning the timeout and failing the WHOLE fetch. So fetch the
+        # title first and append the count later (phase 2) without blocking it.
         try:
             r = subprocess.run(
                 [ytdlp, "--flat-playlist", "--playlist-items", "1",
-                 "--print", "%(playlist_title)s\t%(playlist_count)s\t%(title)s",
-                 "--no-warnings", url],
-                capture_output=True, text=True, env=_ENV, timeout=45,
+                 "--print", "%(playlist_title)s\t%(title)s",
+                 "--no-warnings", "--socket-timeout", "15", url],
+                capture_output=True, text=True, env=_ENV, timeout=90,
             )
             ok  = r.returncode == 0 and r.stdout.strip()
             out = r.stdout.strip() if ok else ""
@@ -713,16 +717,11 @@ class DownloadSlot:
 
         parts    = out.splitlines()[0].split("\t")
         pl_title = parts[0].strip() if len(parts) > 0 else ""
-        pl_count = parts[1].strip() if len(parts) > 1 else ""
-        v_title  = parts[2].strip() if len(parts) > 2 else ""
+        v_title  = parts[1].strip() if len(parts) > 1 else ""
 
         is_pl    = pl_title and pl_title.lower() not in ("na", "none", "") and pl_title != v_title
         has_list = "list=" in url
-        if is_pl:
-            cnt     = f" ({pl_count} videos)" if pl_count not in ("NA", "None", "") else ""
-            display = f"Playlist: {pl_title}{cnt}"
-        else:
-            display = v_title
+        display  = f"Playlist: {pl_title}" if is_pl else v_title
 
         # Warn when "Download entire playlist" is on but the URL points to a single
         # video with no &list=… — yt-dlp has no playlist to expand in that case.
@@ -740,6 +739,27 @@ class DownloadSlot:
                     text_color="#E8A33D",
                 )
         self._app.after(0, _upd)
+
+        # Phase 2 — append the video count once the title is already on screen.
+        if is_pl and not warn and gen == self._fetch_gen:
+            try:
+                rc = subprocess.run(
+                    [ytdlp, "--flat-playlist", "--playlist-items", "1",
+                     "--print", "%(playlist_count)s",
+                     "--no-warnings", "--socket-timeout", "15", url],
+                    capture_output=True, text=True, env=_ENV, timeout=90,
+                )
+                cnt = (rc.stdout.strip().splitlines()[0].strip()
+                       if rc.returncode == 0 and rc.stdout.strip() else "")
+            except Exception:
+                cnt = ""
+            if cnt and cnt not in ("NA", "None") and gen == self._fetch_gen:
+                full  = f"{display} ({cnt} videos)"
+                short = full[:52] + ("…" if len(full) > 52 else "")
+                self._app.after(0, lambda: (
+                    self.title_label.configure(text=full, text_color=C_T1),
+                    self.header_info_label.configure(text=short),
+                ))
 
     # ── Download state ─────────────────────────────────────────────────────────
 
