@@ -18,6 +18,7 @@ import re
 import signal
 import time
 import socket
+import queue
 from pathlib import Path
 
 ctk.set_appearance_mode("dark")
@@ -54,7 +55,7 @@ FORMATS   = ["MP4", "MP3", "MKV", "WebM", "M4A", "Opus"]
 QUALITIES = ["Best", "4K (2160p)", "1080p", "720p", "480p", "360p"]
 SPEEDS    = ["Normal", "Fast", "Maximum"]
 SPEED_DEFAULT    = "Maximum"
-PARALLEL_DEFAULT = "4"
+PARALLEL_DEFAULT = "3"
 DOWNLOAD_DIR     = str(Path.home() / "Downloads")
 
 QUALITY_MAP = {
@@ -71,6 +72,32 @@ SPEED_FLAGS = {
     "Fast":    ["--concurrent-fragments", "8"],
     "Maximum": ["--concurrent-fragments", "16"],
 }
+
+# Stay well under YouTube's rate-limit / bot-detection threshold. The block risk
+# is REQUEST FREQUENCY, not bandwidth, so we pace extraction requests and add a
+# small randomized gap before each download instead of capping speed. These are
+# appended to every download command; combined with MAX_PARALLEL they keep a
+# parallel playlist from hammering the API into a 429 / "confirm you're not a
+# bot" temporary IP suspension.
+THROTTLE_FLAGS = [
+    "--sleep-requests", "1",        # ≥1s between extraction/API requests
+    "--sleep-interval", "1",        # min random sleep before each download
+    "--max-sleep-interval", "5",    # max random sleep before each download
+]
+MAX_PARALLEL = 3                    # hard cap on simultaneous video downloads
+
+# Skip the heavy watch-page player fetch during title lookup — titles come from
+# the lightweight flat-playlist/innertube data, so this is a safe speedup.
+FAST_FETCH_ARGS = ["--extractor-args", "youtube:player_skip=webpage"]
+
+
+def _bps_si(bps):
+    # Bytes/sec → human string, for the console's 3-second average speed.
+    b = float(bps)
+    for unit in ("B", "KB", "MB", "GB"):
+        if b < 1024 or unit == "GB":
+            return f"{b:.1f} {unit}/s"
+        b /= 1024
 
 SLOT_HEADER_H   = 46
 SLOT_EXPANDED_H = 400
@@ -254,6 +281,14 @@ class FolderBrowser(ctk.CTkToplevel):
         )
         self._path_label.grid(row=0, column=1, padx=(2, 10), pady=8, sticky="ew")
 
+        self._newfolder_btn = ctk.CTkButton(
+            pathbar, text="＋ New Folder", width=108, height=30,
+            fg_color=C_GHOST, hover_color=C_GHOST_H,
+            text_color=C_T1, font=ctk.CTkFont(size=12),
+            corner_radius=6, command=self._new_folder,
+        )
+        self._newfolder_btn.grid(row=0, column=2, padx=(0, 8), pady=8)
+
         # ── Folder list ────────────────────────────────────────────────────────
         self._list = ctk.CTkScrollableFrame(
             self, fg_color=C_INPUT, corner_radius=8,
@@ -298,6 +333,21 @@ class FolderBrowser(ctk.CTkToplevel):
 
     def _up(self):
         self._go(os.path.dirname(self._cur))
+
+    def _new_folder(self):
+        # Native/OS dialogs crash this bundle, so use CTk's own in-app input dialog
+        # (a plain Tk Toplevel — always visible, no subprocess, no TCC prompt).
+        dlg  = ctk.CTkInputDialog(text="New folder name:", title="Create Folder")
+        name = (dlg.get_input() or "").strip().strip("/")
+        if not name:
+            return
+        target = os.path.join(self._cur, name)
+        try:
+            os.makedirs(target, exist_ok=True)
+        except OSError as e:
+            self._sel_hint.configure(text=f"Could not create: {e}", text_color=C_DANGER)
+            return
+        self._go(target)
 
     def _render(self):
         for w in self._list.winfo_children():
@@ -376,6 +426,7 @@ class DownloadSlot:
         self._current_title = ""
         self._active        = {}     # idx -> {title, pct, size, speed} for live per-video stats
         self._pl_render_id  = None   # pending after() id for the periodic renderer
+        self._pl_running    = False  # True while a parallel playlist run is in flight
 
         self.format_var   = ctk.StringVar(value="MP4")
         self.quality_var  = ctk.StringVar(value="Best")
@@ -553,7 +604,7 @@ class DownloadSlot:
         ).pack(side="left")
         ctk.CTkOptionMenu(
             self.parallel_frame,
-            values=["1", "2", "3", "4"],
+            values=["1", "2", "3"],
             variable=self.parallel_var,
             width=62, font=_FONT_SML,
             fg_color=C_INPUT, button_color=C_GHOST_H,
@@ -622,13 +673,16 @@ class DownloadSlot:
         self.stop_btn.grid(row=0, column=2, padx=(0, 8), pady=6)
         self.stop_btn.grid_remove()
 
-        # ── Per-video detail rows (parallel playlist mode) ─────────────────────
-        self.detail_label = ctk.CTkLabel(
-            self.body_frame, text="", anchor="w", justify="left",
-            text_color=C_T2, font=ctk.CTkFont(size=11),
+        # ── Console log: timestamped per-video name • size • 3s-avg speed • ETA,
+        #    plus errors, so the user sees exactly what each download is doing. ──
+        self.console = ctk.CTkTextbox(
+            self.body_frame, height=140, fg_color=C_INPUT, text_color=C_T2,
+            font=ctk.CTkFont(family="Menlo", size=11), wrap="word",
+            border_width=0, corner_radius=8,
         )
-        self.detail_label.grid(row=4, column=0, padx=16, pady=(2, 6), sticky="ew")
-        self.detail_label.grid_remove()
+        self.console.grid(row=4, column=0, padx=16, pady=(2, 6), sticky="ew")
+        self.console.configure(state="disabled")
+        self.console.grid_remove()
 
     # ── Collapse ───────────────────────────────────────────────────────────────
 
@@ -699,7 +753,8 @@ class DownloadSlot:
             r = subprocess.run(
                 [ytdlp, "--flat-playlist", "--playlist-items", "1",
                  "--print", "%(playlist_title)s\t%(title)s",
-                 "--no-warnings", "--socket-timeout", "15", url],
+                 "--no-warnings", "--socket-timeout", "10",
+                 *FAST_FETCH_ARGS, url],
                 capture_output=True, text=True, env=_ENV, timeout=90,
             )
             ok  = r.returncode == 0 and r.stdout.strip()
@@ -772,17 +827,20 @@ class DownloadSlot:
         url = self.url_entry.get().strip()
         if not url:
             return
-        self._stop_requested = False
-        self._speed_samples  = []
-        self._last_ui_upd    = 0.0
-        self._last_pct       = 0.0
-        self._pl_total       = 0
-        self._pl_ok          = 0
-        self._pl_fail        = 0
-        self._pl_active      = 0
-        self._active         = {}
-        self._processes      = []
-        self._current_title  = ""
+        # Reset shared state under the lock — a worker thread from a prior run
+        # could in theory still be unwinding when a new run starts.
+        with self._pl_lock:
+            self._stop_requested = False
+            self._speed_samples  = []
+            self._last_ui_upd    = 0.0
+            self._last_pct       = 0.0
+            self._pl_total       = 0
+            self._pl_ok          = 0
+            self._pl_fail        = 0
+            self._pl_active      = 0
+            self._active         = {}
+            self._processes      = []
+            self._current_title  = ""
         self._set_busy()
 
         if self.playlist_var.get():
@@ -798,20 +856,25 @@ class DownloadSlot:
         self.stop_btn.grid()
 
     def _set_idle(self, status="Ready"):
-        self._process   = None
-        self._processes = []
+        self._pl_running = False
+        self._process    = None
+        self._processes  = []
         for w in (self.format_menu, self.quality_menu, self.playlist_check, self.speed_menu):
             w.configure(state="normal")
         self.stop_btn.grid_remove()
-        if self.detail_label is not None:
-            self.detail_label.configure(text="")
-            self.detail_label.grid_remove()
         self._set_status(status)
+        if status not in ("Ready",):
+            self._log(status)
         self._app._on_slot_state_change()
 
     def stop_download(self):
         self._stop_requested = True
-        procs = list(self._processes)
+        # Snapshot under _pl_lock: _dl_one appends each child to _processes under the
+        # same lock, so an unguarded read here can race past a child that's mid-Popen
+        # (already past the _stop_requested guard, not yet appended) and miss it in
+        # the kill sweep — leaving an orphan holding a *.part open (Finder -8058).
+        with self._pl_lock:
+            procs = list(self._processes)
         if self._process:
             procs.append(self._process)
         for p in procs:
@@ -870,6 +933,19 @@ class DownloadSlot:
         self.status_label.configure(text=text)
         self.spd_label.configure(text=speed)
 
+    def _log(self, msg):
+        # Append a timestamped line to the slot console and autoscroll. Main thread
+        # ONLY — worker threads must route through self._app.after(0, ...).
+        try:
+            ts = time.strftime("%H:%M:%S")
+            self.console.configure(state="normal")
+            self.console.insert("end", f"[{ts}] {msg}\n")
+            self.console.see("end")
+            self.console.configure(state="disabled")
+            self.console.grid()
+        except Exception:
+            pass
+
     def _choose_dir(self):
         # In-app folder browser. Native pickers are unusable in this bundle:
         #  * tkinter.filedialog.askdirectory() CRASHES the frozen app on macOS
@@ -887,7 +963,7 @@ class DownloadSlot:
 
     # ── Command building ───────────────────────────────────────────────────────
 
-    def _build_cmd(self, url, playlist_item=None):
+    def _build_cmd(self, url, playlist_item=None, force_no_playlist=False):
         fmt      = self.format_var.get().lower()
         quality  = self.quality_var.get()
         ytdlp    = _find_bin("yt-dlp")
@@ -920,10 +996,11 @@ class DownloadSlot:
         # download and individual fragments instead of erroring out.
         cmd += ["--retries", "5", "--fragment-retries", "20",
                 "--retry-sleep", "3", "--no-update"]
+        cmd += THROTTLE_FLAGS
 
         if playlist_item is not None:
             cmd += ["--playlist-items", str(playlist_item)]
-        elif not self.playlist_var.get():
+        elif force_no_playlist or not self.playlist_var.get():
             cmd.append("--no-playlist")
 
         cmd += ["--newline", "--progress", url]
@@ -955,6 +1032,12 @@ class DownloadSlot:
 
     # ── Playlist parallel ──────────────────────────────────────────────────────
 
+    def _vid_url(self, vid):
+        # Each parallel child downloads this single-video URL with --no-playlist,
+        # so it never re-enumerates the whole playlist (which rate-limits YouTube
+        # and throttles fragments to ~0 KB/s under parallel load).
+        return f"https://www.youtube.com/watch?v={vid}"
+
     def _get_playlist_ids(self, url):
         # Enumerating a playlist can take 20-60s+ when YouTube throttles/rate-limits
         # (worse on the current yt-dlp's heavier extraction). One retry + a generous
@@ -982,26 +1065,41 @@ class DownloadSlot:
         if not ids:
             self._app.after(0, lambda: self._set_idle("Could not fetch playlist."))
             return
+        self._pl_running = True
 
-        n = int(self.parallel_var.get())
+        # Cap concurrency so a parallel playlist never opens more simultaneous
+        # YouTube connections than the rate-limit threshold tolerates.
+        n = min(MAX_PARALLEL, max(1, int(self.parallel_var.get())))
         self._pl_total = len(ids)
         self._pl_ok    = 0
         self._pl_fail  = 0
         self._app.after(0, lambda: self._set_status(f"0/{self._pl_total} videos done"))
 
-        sem     = threading.Semaphore(n)
-        threads = [
-            threading.Thread(
-                target=self._dl_one,
-                args=(url, i + 1, len(ids), sem),
-                daemon=True,
-            )
-            for i in range(len(ids))
-        ]
+        # Bounded worker pool: exactly `n` worker threads drain a queue of videos,
+        # instead of spawning one thread per playlist item up front (which for a
+        # large playlist meant hundreds of idle threads). Each child still downloads
+        # its resolved single-video "watch?v=<id>" URL with --no-playlist, so no
+        # child re-enumerates the whole playlist (the rate-limit → 0-byte .part
+        # stall). The semaphore is kept for _dl_one's own cap guarantee; with n
+        # workers and n permits it never blocks, but it keeps _dl_one self-bounded.
+        work = queue.Queue()
+        for i in range(len(ids)):
+            work.put((self._vid_url(ids[i]), i + 1))
+        sem = threading.Semaphore(n)
+
+        def _worker():
+            while not self._stop_requested:
+                try:
+                    vurl, idx = work.get_nowait()
+                except queue.Empty:
+                    return
+                self._dl_one(vurl, idx, len(ids), sem)
+
+        workers = [threading.Thread(target=_worker, daemon=True) for _ in range(n)]
         # Kick off the periodic UI renderer on the main thread.
         self._app.after(0, self._render_pl)
-        for t in threads: t.start()
-        for t in threads: t.join()
+        for t in workers: t.start()
+        for t in workers: t.join()
 
         if self._stop_requested:
             return
@@ -1021,43 +1119,42 @@ class DownloadSlot:
             active = {i: dict(e) for i, e in self._active.items()}
 
         pct  = (ok + fail) / total if total else 0
-        head = f"{ok}/{total} videos done"
+        head = f"{ok}/{total} done"
         if active:
             head += f"  •  {len(active)} downloading"
         if fail:
             head += f"  •  {fail} failed"
 
-        lines = []
-        for idx in sorted(active):
-            e = active[idx]
-            t = (e.get("title") or f"item {idx}")[:34]
-            if "pct" in e:
-                lines.append(f"↓ {t} — {e['pct']:.0f}%  •  {e.get('size','')}  •  {e.get('speed','')}")
-            else:
-                lines.append(f"↓ {t} — starting…")
-
         self.progress_bar.set(pct)
         self.status_label.configure(text=head)
         self.spd_label.configure(text="")
-        if lines:
-            self.detail_label.configure(text="\n".join(lines))
-            self.detail_label.grid()
-        else:
-            self.detail_label.grid_remove()
 
-        if self.is_downloading():
-            self._pl_render_id = self._app.after(1500, self._render_pl)
+        # One console line per active video each tick (every UI_UPDATE_SECS), with
+        # the 3-second average speed and an ETA derived from it.
+        for idx in sorted(active):
+            e = active[idx]
+            if "pct" not in e:
+                continue
+            name = (e.get("title") or f"item {idx}")[:40]
+            bps  = e.get("spd_bps", 0)
+            spd  = _bps_si(bps) if bps else e.get("speed", "")
+            remaining = e.get("bytes", 0) * (1 - e["pct"] / 100)
+            eta  = _fmt_eta(remaining / bps) if bps > 0 else "—"
+            self._log(f"{name}  {e['pct']:.0f}%  •  {e.get('size','')}  •  {spd}  •  ETA {eta}")
+
+        if self._pl_running:
+            self._pl_render_id = self._app.after(int(UI_UPDATE_SECS * 1000), self._render_pl)
         else:
             self._pl_render_id = None
 
-    def _dl_one(self, url, idx, total, sem):
+    def _dl_one(self, video_url, idx, total, sem):
         with sem:
             if self._stop_requested:
                 return
             with self._pl_lock:
                 self._pl_active += 1
                 self._active.setdefault(idx, {})
-            cmd = self._build_cmd(url, playlist_item=idx)
+            cmd = self._build_cmd(video_url, force_no_playlist=True)
             rc = -1
             try:
                 p = subprocess.Popen(
@@ -1076,6 +1173,7 @@ class DownloadSlot:
                 rc = -1
             finally:
                 with self._pl_lock:
+                    name = (self._active.get(idx) or {}).get("title", f"item {idx}")
                     self._pl_active = max(0, self._pl_active - 1)
                     if not self._stop_requested:
                         if rc == 0:
@@ -1083,11 +1181,26 @@ class DownloadSlot:
                         else:
                             self._pl_fail += 1
                     self._active.pop(idx, None)
+                if not self._stop_requested:
+                    done = (f"✓ done    {name}" if rc == 0
+                            else f"✗ failed  {name} (exit {rc})")
+                    try: self._app.after(0, lambda m=done: self._log(m))
+                    except Exception: pass
 
     # ── Progress parsing ───────────────────────────────────────────────────────
 
     def _parse_progress(self, line, pl_idx, pl_total):
         parallel = pl_idx is not None
+
+        # Surface yt-dlp errors/warnings in the console so the log is accurate.
+        if line.startswith("ERROR") or "ERROR:" in line:
+            try: self._app.after(0, lambda l=line: self._log(f"⚠ {l}"))
+            except Exception: pass
+            return
+
+        # KNOWN PARSER GAP (intentionally unhandled): estimated-size progress lines
+        # like "[download] 10% of ~ 50.00MiB at 2.00MiB/s ETA 00:20" (note the "~ ")
+        # match neither percent regex below and are silently skipped.
 
         # In parallel playlist mode each child runs `--playlist-items N`. Stash its
         # title + live %/size/speed into self._active[idx]; the periodic renderer
@@ -1099,20 +1212,29 @@ class DownloadSlot:
                 name = re.sub(r"\.f\d+$", "", name)   # drop yt-dlp format-code suffix
                 with self._pl_lock:
                     self._active.setdefault(pl_idx, {})["title"] = name
+                try: self._app.after(0, lambda n=name: self._log(f"↓ start   {n}"))
+                except Exception: pass
                 return
             m = re.search(
-                r"\[download\]\s+([\d.]+)%\s+of\s+(\S+)\s+at\s+(\S+/s)", line)
+                r"\[download\]\s+([\d.]+)%\s+of\s+~?\s*(\S+)\s+at\s+(\S+/s)", line)
             if m:
+                bps = _spd_to_bytes(m.group(3))
                 with self._pl_lock:
                     e = self._active.setdefault(pl_idx, {})
                     e["pct"]   = float(m.group(1))
                     e["size"]  = _to_si(m.group(2))
                     e["speed"] = _to_si(m.group(3).replace("/s", "")) + "/s"
+                    e["bytes"] = _to_bytes(m.group(2))
+                    samples = e.setdefault("spd", [])
+                    samples.append(bps)
+                    if len(samples) > 6:        # ~3s window at ~2 ticks/s
+                        samples.pop(0)
+                    e["spd_bps"] = sum(samples) / len(samples)
                 return
             return
 
         m = re.search(
-            r"\[download\]\s+([\d.]+)%\s+of\s+(\S+)\s+at\s+(\S+/s)\s+ETA\s+\S+",
+            r"\[download\]\s+([\d.]+)%\s+of\s+~?\s*(\S+)\s+at\s+(\S+/s)\s+ETA\s+\S+",
             line,
         )
         if m:
@@ -1148,11 +1270,16 @@ class DownloadSlot:
                         self.progress_bar.set(p)
                     self._set_status(s, sp)
                 self._app.after(0, _upd)
+                nm = (title or "")[:40]
+                cline = f"{nm}  {pct_raw*100:.0f}%  •  {size_si}  •  {spd_si}  •  ETA {eta_str}"
+                try: self._app.after(0, lambda m=cline.strip(): self._log(m))
+                except Exception: pass
             return
 
         m_dest = re.search(r"\[download\] Destination: (.+)", line)
         if m_dest:
             name = os.path.splitext(os.path.basename(m_dest.group(1)))[0]
+            name = re.sub(r"\.f\d+$", "", name)   # drop yt-dlp format-code suffix (match parallel)
             self._current_title = name
             if pl_idx is None:
                 self._app.after(0, lambda n=name: self._set_status(f"↓ {n}"))
