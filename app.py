@@ -67,10 +67,15 @@ QUALITY_MAP = {
     "360p":       "bestvideo[height<=360]+bestaudio/best[height<=360]",
 }
 
+# concurrent-fragments = simultaneous HTTPS connections PER download. The total
+# open connections to YouTube is (active downloads) × (fragments). A previous
+# build ran 4 parallel × 16 fragments = 64 connections and got the IP suspended,
+# so these are kept small: worst case is MAX_PARALLEL × MAX_FRAGMENTS connections.
+MAX_FRAGMENTS = 4
 SPEED_FLAGS = {
-    "Normal":  [],
-    "Fast":    ["--concurrent-fragments", "8"],
-    "Maximum": ["--concurrent-fragments", "16"],
+    "Normal":  [],                                    # 1 connection (sequential)
+    "Fast":    ["--concurrent-fragments", "2"],
+    "Maximum": ["--concurrent-fragments", str(MAX_FRAGMENTS)],
 }
 
 # Stay well under YouTube's rate-limit / bot-detection threshold. The block risk
@@ -85,11 +90,6 @@ THROTTLE_FLAGS = [
     "--max-sleep-interval", "5",    # max random sleep before each download
 ]
 MAX_PARALLEL = 3                    # hard cap on simultaneous video downloads
-
-# Skip the heavy watch-page player fetch during title lookup — titles come from
-# the lightweight flat-playlist/innertube data, so this is a safe speedup.
-FAST_FETCH_ARGS = ["--extractor-args", "youtube:player_skip=webpage"]
-
 
 def _bps_si(bps):
     # Bytes/sec → human string, for the console's 3-second average speed.
@@ -753,8 +753,7 @@ class DownloadSlot:
             r = subprocess.run(
                 [ytdlp, "--flat-playlist", "--playlist-items", "1",
                  "--print", "%(playlist_title)s\t%(title)s",
-                 "--no-warnings", "--socket-timeout", "10",
-                 *FAST_FETCH_ARGS, url],
+                 "--no-warnings", "--socket-timeout", "15", url],
                 capture_output=True, text=True, env=_ENV, timeout=90,
             )
             ok  = r.returncode == 0 and r.stdout.strip()
@@ -774,9 +773,16 @@ class DownloadSlot:
         pl_title = parts[0].strip() if len(parts) > 0 else ""
         v_title  = parts[1].strip() if len(parts) > 1 else ""
 
-        is_pl    = pl_title and pl_title.lower() not in ("na", "none", "") and pl_title != v_title
+        # Detect a playlist from the URL FIRST (instant, reliable) — a "&list=…"
+        # link is a playlist even when yt-dlp returns no playlist_title. Fall back
+        # to the fetched playlist title for the display name when we have one.
         has_list = "list=" in url
-        display  = f"Playlist: {pl_title}" if is_pl else v_title
+        pl_name  = (pl_title if pl_title and pl_title.lower() not in ("na", "none", "")
+                    else "")
+        is_pl    = has_list or bool(pl_name and pl_name != v_title)
+        display  = (f"Playlist: {pl_name}" if pl_name
+                    else f"Playlist • {v_title}" if has_list
+                    else v_title)
 
         # Warn when "Download entire playlist" is on but the URL points to a single
         # video with no &list=… — yt-dlp has no playlist to expand in that case.
