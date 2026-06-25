@@ -139,7 +139,7 @@ def test_speed_flags_no_aria2c():
     # Regression: aria2c left 0-byte .part files on YouTube; must be gone.
     for name, flags in app.SPEED_FLAGS.items():
         assert "aria2c" not in " ".join(flags), f"{name} still references aria2c"
-    assert app.SPEED_FLAGS["Maximum"] == ["--concurrent-fragments", "16"]
+    assert app.SPEED_FLAGS["Maximum"] == ["--concurrent-fragments", str(app.MAX_FRAGMENTS)]
     assert app.SPEED_FLAGS["Normal"] == []
 
 
@@ -406,6 +406,19 @@ def test_run_playlist_parallel_uses_bounded_worker_pool():
     assert "range(n)" in src, "must spawn exactly n workers, not one per video"
 
 
+def test_connection_budget_stays_below_youtube_threshold():
+    # Safety: a previous build ran 4 parallel × 16 fragments = 64 simultaneous
+    # connections and got the IP suspended. Worst case is MAX_PARALLEL × the
+    # largest concurrent-fragments value; keep it comfortably under that 64.
+    frags = [int(flags[flags.index("--concurrent-fragments") + 1])
+             for flags in app.SPEED_FLAGS.values()
+             if "--concurrent-fragments" in flags]
+    peak_frag  = max(frags) if frags else 1
+    worst_case = app.MAX_PARALLEL * peak_frag
+    assert worst_case <= 16, f"worst-case {worst_case} connections too close to the 64 limit"
+    assert app.MAX_FRAGMENTS == peak_frag, "MAX_FRAGMENTS must match the Maximum preset"
+
+
 # ── Network tests (the real end-to-end verification) ────────────────────────────
 
 def test_get_playlist_ids_live():
@@ -459,6 +472,7 @@ DETERMINISTIC = [
     test_stop_download_snapshots_processes_under_lock,
     test_parse_progress_handles_estimated_size,
     test_run_playlist_parallel_uses_bounded_worker_pool,
+    test_connection_budget_stays_below_youtube_threshold,
 ]
 NETWORK = [
     test_get_playlist_ids_live,
